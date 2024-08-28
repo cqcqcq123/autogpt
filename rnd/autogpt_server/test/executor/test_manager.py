@@ -35,7 +35,7 @@ async def assert_sample_graph_executions(
     test_user: User,
     graph_exec_id: str,
 ):
-    executions = await agent_server.get_run_execution_results(
+    executions = await agent_server.get_graph_run_node_execution_results(
         test_graph.id, graph_exec_id, test_user.id
     )
 
