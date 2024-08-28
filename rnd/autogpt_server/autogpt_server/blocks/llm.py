@@ -1,6 +1,7 @@
 import logging
 from enum import Enum
-from typing import List, NamedTuple
+from json import JSONDecodeError
+from typing import Any, List, NamedTuple
 
 import anthropic
 import ollama
@@ -86,7 +87,7 @@ class ObjectLlmCallBlock(Block):
         retry: int = 3
 
     class Output(BlockSchema):
-        response: dict[str, str]
+        response: dict[str, Any]
         error: str
 
     def __init__(self):
@@ -132,16 +133,33 @@ class ObjectLlmCallBlock(Block):
             )
             return response.choices[0].message.content or ""
         elif provider == "anthropic":
-            sysprompt = "".join([p["content"] for p in prompt if p["role"] == "system"])
-            usrprompt = [p for p in prompt if p["role"] == "user"]
+            system_messages = [p["content"] for p in prompt if p["role"] == "system"]
+            sysprompt = " ".join(system_messages)
+
+            messages = []
+            last_role = None
+            for p in prompt:
+                if p["role"] in ["user", "assistant"]:
+                    if p["role"] != last_role:
+                        messages.append({"role": p["role"], "content": p["content"]})
+                        last_role = p["role"]
+                    else:
+                        # If the role is the same as the last one, combine the content
+                        messages[-1]["content"] += "\n" + p["content"]
+
             client = anthropic.Anthropic(api_key=api_key)
-            response = client.messages.create(
-                model=model.value,
-                max_tokens=4096,
-                system=sysprompt,
-                messages=usrprompt,  # type: ignore
-            )
-            return response.content[0].text if response.content else ""
+            try:
+                response = client.messages.create(
+                    model=model.value,
+                    max_tokens=4096,
+                    system=sysprompt,
+                    messages=messages,
+                )
+                return response.content[0].text if response.content else ""
+            except anthropic.APIError as e:
+                error_message = f"Anthropic API error: {str(e)}"
+                logger.error(error_message)
+                raise ValueError(error_message)
         elif provider == "groq":
             client = Groq(api_key=api_key)
             response_format = {"type": "json_object"} if json_format else None
@@ -187,14 +205,16 @@ class ObjectLlmCallBlock(Block):
 
         prompt.append({"role": "user", "content": input_data.prompt})
 
-        def parse_response(resp: str) -> tuple[dict[str, str], str | None]:
+        def parse_response(resp: str) -> tuple[dict[str, Any], str | None]:
             try:
                 parsed = json.loads(resp)
+                if not isinstance(parsed, dict):
+                    return {}, f"Expected a dictionary, but got {type(parsed)}"
                 miss_keys = set(input_data.expected_format.keys()) - set(parsed.keys())
                 if miss_keys:
                     return parsed, f"Missing keys: {miss_keys}"
                 return parsed, None
-            except Exception as e:
+            except JSONDecodeError as e:
                 return {}, f"JSON decode error: {e}"
 
         logger.warning(f"LLM request: {prompt}")
@@ -218,7 +238,16 @@ class ObjectLlmCallBlock(Block):
                 if input_data.expected_format:
                     parsed_dict, parsed_error = parse_response(response_text)
                     if not parsed_error:
-                        yield "response", {k: str(v) for k, v in parsed_dict.items()}
+                        yield "response", {
+                            k: (
+                                json.loads(v)
+                                if isinstance(v, str)
+                                and v.startswith("[")
+                                and v.endswith("]")
+                                else (", ".join(v) if isinstance(v, list) else v)
+                            )
+                            for k, v in parsed_dict.items()
+                        }
                         return
                 else:
                     yield "response", {"response": response_text}
